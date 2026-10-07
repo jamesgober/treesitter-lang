@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "treesitter-lang"
-version = "0.1.0"
+version = "1.0.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -16,13 +16,13 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "Tree-sitter grammar generation from a CST grammar."
+description = "Generate Tree-sitter grammars (grammar.js and grammar.json) and corpus tests from Rust."
 
 # Keywords (5 max)
-keywords = [language,treesitter,grammar,parser]
+keywords = ["tree-sitter", "grammar", "parser", "language", "codegen"]
 
 # Categories
-categories = [development-tools,parser-implementations]
+categories = ["development-tools", "parsing", "text-editors"]
 
 # Links
 homepage      = "https://github.com/jamesgober/treesitter-lang"
@@ -45,15 +45,18 @@ path = "src/lib.rs"
 # #################################
 [features]
 default = ["std"]
-std = []
-# Serialization support.
-serde = ["dep:serde"]
+# The standard library. Without it the crate is `no_std` and needs only `alloc`.
+std = ["syntax-lang/std"]
 
 
 # DEPENDENCIES
 # #################################
 [dependencies]
-serde = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
+# The family's concrete syntax tree. `Grammar::sexp` renders a
+# `syntax_lang::Node` as the S-expression tree-sitter prints, which turns the
+# trees a hand-written parser builds into tree-sitter corpus tests. Re-exported
+# so callers always name the same version.
+syntax-lang = { version = "1", default-features = false }
 
 
 # DEV DEPENDENCIES
@@ -61,9 +64,6 @@ serde = { version = "1", optional = true, default-features = false, features = [
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
-
-[target.'cfg(loom)'.dev-dependencies]
-loom = "0.7"
 
 
 # BENCHMARKS

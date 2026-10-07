@@ -35,14 +35,48 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Clippy (all features)
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Clippy (no default features)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
       - name: Test (default features)
         run: cargo test
       - name: Test (all features)
         run: cargo test --all-features
+      - name: Test (no default features)
+        run: cargo test --no-default-features
+      - name: Build examples
+        run: cargo build --examples
       - name: Doc (all features)
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+  tree-sitter:
+    # Emits grammars and a corpus, then holds them to the real tree-sitter
+    # CLI: generation must succeed, our grammar.json must equal the one
+    # tree-sitter writes, both formats must produce the same parser, and the
+    # corpus built from the hand-written parser's trees must pass.
+    name: Tree-sitter conformance
+    runs-on: ubuntu-latest
+    env:
+      TREE_SITTER_VERSION: "0.27.0"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the tree-sitter CLI
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL "https://github.com/tree-sitter/tree-sitter/releases/download/v${TREE_SITTER_VERSION}/tree-sitter-linux-x64.gz" \
+            | gunzip > "$RUNNER_TEMP/bin/tree-sitter"
+          chmod +x "$RUNNER_TEMP/bin/tree-sitter"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Emit grammars and corpus
+        run: |
+          cargo run --example generate -- target/conformance/mini
+          cargo run --example corpus -- target/conformance/mini
+          TREESITTER_LANG_CONFORMANCE_DIR=target/conformance cargo test --test conformance
+      - name: Check against tree-sitter
+        run: bash dev/conformance.sh target/conformance
 
   security:
     name: Security (audit + deny)
