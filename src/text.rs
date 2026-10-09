@@ -106,13 +106,27 @@ pub(crate) fn js_string(out: &mut String, text: &str) {
 /// or after a backslash — become `\n`, `\r`, `\t`, `\xHH`, `\u2028`, and
 /// `\u2029`, which match the same characters. A trailing lone backslash is
 /// doubled so the literal still closes.
+///
+/// The literal must also end at its closing slash whatever the pattern
+/// holds. JavaScript reads a `[` as opening a character class that runs to
+/// the next unescaped `]`, and inside one a `/` does not end the literal, so
+/// an unclosed `[` would carry the literal past its closing slash into the
+/// text after it. Validation refuses such patterns; as a second line of
+/// defence, every `[` from the first one that opens a class never closed is
+/// written `\[`, so no class is left open at the end. A valid pattern has no
+/// such `[` and is written unchanged.
 pub(crate) fn js_regex(out: &mut String, pattern: &str) {
     let bytes = pattern.as_bytes();
+    let unclosed = unclosed_class(bytes).unwrap_or(bytes.len());
     let mut from = 0;
     let mut at = 0;
     while at < bytes.len() {
         let (escape, width): (&str, usize) = match bytes[at] {
             b'/' => ("\\/", 1),
+            // Past the first unclosed class there is no unescaped `]` at
+            // all, so every `[` from there on would open a class that never
+            // closes.
+            b'[' if at >= unclosed => ("\\[", 1),
             b @ 0x00..=0x1F => {
                 out.push_str(&pattern[from..at]);
                 control(out, b);
@@ -207,9 +221,36 @@ fn control(out: &mut String, byte: u8) {
     }
 }
 
+/// Where the first character class that is never closed opens, reading the
+/// pattern the way a JavaScript lexer reads the body of a regular expression
+/// literal: a backslash escapes the next character, a `[` outside a class
+/// opens one, and the next `]` inside it closes it.
+///
+/// The rewrites [`js_regex`] makes do not change this reading: they turn
+/// single characters into escapes, which contain no unescaped bracket, and
+/// keep every backslash paired with the character it escaped. Skipping one
+/// byte after a backslash is enough: a skipped multi-byte character's other
+/// bytes are continuation bytes, never `[`, `]`, or `\`.
+fn unclosed_class(bytes: &[u8]) -> Option<usize> {
+    let mut open = None;
+    let mut at = 0;
+    while let Some(&b) = bytes.get(at) {
+        match (b, open) {
+            (b'\\', _) => at += 1,
+            (b'[', None) => open = Some(at),
+            (b']', Some(_)) => open = None,
+            _ => {}
+        }
+        at += 1;
+    }
+    open
+}
+
 /// Whether [`js_regex`] would write `pattern` differently from how it reads.
 pub(crate) fn js_regex_rewrites(pattern: &str) -> bool {
-    pattern.ends_with('\\') || pattern.bytes().any(|b| b == b'/' || b == 0xE2 || b < 0x20)
+    pattern.ends_with('\\')
+        || pattern.bytes().any(|b| b == b'/' || b == 0xE2 || b < 0x20)
+        || unclosed_class(pattern.as_bytes()).is_some()
 }
 
 /// Appends `prefix` and the byte as two lowercase hex digits.
@@ -262,6 +303,31 @@ mod tests {
         assert_eq!(run(js_regex, r"\\/"), r"\\\/");
         assert_eq!(run(js_regex, "\\é/"), "\\é\\/");
         assert_eq!(run(js_regex, "\\\u{2192}"), "\\\u{2192}");
+    }
+
+    #[test]
+    fn test_js_regex_never_leaves_a_class_open() {
+        // A class that closes is written as it is.
+        assert_eq!(run(js_regex, "[a]"), "[a]");
+        assert_eq!(run(js_regex, "[]"), "[]");
+        assert_eq!(run(js_regex, "[[]"), "[[]");
+        assert_eq!(run(js_regex, r"[\]/]"), r"[\]\/]");
+        assert!(!js_regex_rewrites("[a][[]"));
+        // From the first `[` whose class never closes, every unescaped `[`
+        // is escaped; escaped ones are left alone.
+        assert_eq!(run(js_regex, "["), r"\[");
+        assert_eq!(run(js_regex, "[/"), r"\[\/");
+        assert_eq!(run(js_regex, "a[b"), r"a\[b");
+        assert_eq!(run(js_regex, "[a]["), r"[a]\[");
+        assert_eq!(run(js_regex, "[[a"), r"\[\[a");
+        assert_eq!(run(js_regex, r"[\[a"), r"\[\[a");
+        assert_eq!(run(js_regex, r"[\]"), r"\[\]");
+        assert_eq!(run(js_regex, r"[a\"), r"\[a\\");
+        assert!(js_regex_rewrites("["));
+        assert!(js_regex_rewrites("[a]["));
+        assert_eq!(unclosed_class(b"[a]["), Some(3));
+        assert_eq!(unclosed_class(b"[a\\]"), Some(0));
+        assert_eq!(unclosed_class(b"\\[a"), None);
     }
 
     #[test]

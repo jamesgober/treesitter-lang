@@ -188,6 +188,162 @@ fn test_validate_empty_pattern_is_refused_anywhere() {
     );
 }
 
+/// The `rule` of an invalid-pattern error, or a description of what came
+/// back instead.
+fn pattern_error(result: Result<String, Error>) -> String {
+    match result {
+        Err(Error::EmptyString { rule }) => rule,
+        other => format!("not an invalid pattern: {other:?}"),
+    }
+}
+
+#[test]
+fn test_regression_h06_unclosed_class_cannot_carry_text_into_code() {
+    // ISSUES H06. JavaScript reads `[` as opening a character class, inside
+    // which `/` does not end a regular expression literal. In 1.0.0 the
+    // pattern `[` was written `/[/`, so the literal ran on through the
+    // string after it, whose text after `]` became code that `tree-sitter
+    // generate` would run when it evaluated `grammar.js`.
+    let payload = r#"]/,require("fs").rmSync("x")),//"#;
+    let exploit = |g: Grammar| g.rule("x", Rule::seq([Rule::pattern("["), s(payload)]));
+    let expected = "x: unterminated character class at byte 0 of `[`";
+    // Refused in both formats, in reachable and unreachable rules alike:
+    // `grammar.js` evaluates every rule.
+    assert_eq!(pattern_error(exploit(reaching(&["x"])).to_js()), expected);
+    assert_eq!(pattern_error(exploit(reaching(&["x"])).to_json()), expected);
+    assert_eq!(pattern_error(exploit(base()).to_js()), expected);
+    let mut buffer = String::new();
+    assert!(exploit(base()).write_js(&mut buffer).is_err());
+    assert!(buffer.is_empty());
+    // The error says what is wrong and where.
+    let error = exploit(base()).to_js().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "`x` contains an invalid pattern: unterminated character class at byte 0 of `[`"
+    );
+    // The same payload behind a valid pattern is just a string.
+    let safe = base()
+        .rule("x", Rule::seq([Rule::pattern("[[]"), s(payload)]))
+        .to_js()
+        .unwrap();
+    assert!(safe.contains(r#"x: $ => seq(/[[]/, ']/,require("fs").rmSync("x")),//'),"#));
+}
+
+#[test]
+fn test_validate_patterns_javascript_refuses_are_refused_everywhere() {
+    // Each would make `grammar.js` fail to load: node and tree-sitter's
+    // QuickJS both throw a SyntaxError for every one of them.
+    let cases = [
+        ("(a", "unterminated group at byte 0 of `(a`"),
+        ("a)", "unmatched `)` at byte 1 of `a)`"),
+        (
+            "a**",
+            "a quantifier has nothing to repeat at byte 2 of `a**`",
+        ),
+        (
+            "a{2,1}",
+            "the numbers in a `{}` quantifier are out of order at byte 1 of `a{2,1}`",
+        ),
+        (
+            "[z-a]",
+            "a character class range is out of order at byte 1 of `[z-a]`",
+        ),
+        (
+            "(?<=a)*",
+            "a quantifier has nothing to repeat at byte 6 of `(?<=a)*`",
+        ),
+        ("a/[", "unterminated character class at byte 2 of `a/[`"),
+    ];
+    for (pattern, problem) in cases {
+        let unreachable = base().rule("x", Rule::pattern(pattern));
+        assert_eq!(pattern_error(unreachable.to_js()), format!("x: {problem}"));
+        let extra = base().extra(Rule::pattern(pattern));
+        assert_eq!(pattern_error(extra.to_json()), format!("extras: {problem}"));
+    }
+}
+
+#[test]
+fn test_validate_patterns_tree_sitter_refuses_are_refused_where_it_reads_them() {
+    // Valid JavaScript, but tree-sitter's regex parser refuses them:
+    // "Regex error: Assertions are not supported", "regex parse error".
+    // Tree-sitter only parses the patterns of rules it keeps.
+    let cases = [
+        (
+            "^a",
+            "assertions (`^`, `$`, `\\b`, `\\B`, ...) are not supported by tree-sitter at byte 0 of `^a`",
+        ),
+        (
+            "(?=a)",
+            "look-ahead and look-behind are not supported by tree-sitter at byte 0 of `(?=a)`",
+        ),
+        (
+            r"\1",
+            "backreferences and octal escapes (`\\0` to `\\9`) are not supported by tree-sitter at byte 0 of `\\1`",
+        ),
+        ("[[a]", "unterminated character class at byte 0 of `[[a]`"),
+        (
+            "a{,2}",
+            "a counted repetition needs a number at byte 2 of `a{,2}`",
+        ),
+        (r"\e", "unrecognized escape sequence at byte 0 of `\\e`"),
+    ];
+    for (pattern, problem) in cases {
+        let unreachable = base().rule("x", Rule::pattern(pattern));
+        assert!(unreachable.to_js().is_ok(), "{pattern}");
+        let reachable = reaching(&["x"]).rule("x", Rule::pattern(pattern));
+        assert_eq!(pattern_error(reachable.to_js()), format!("x: {problem}"));
+        let extra = base().extra(Rule::token(Rule::seq([s("#"), Rule::pattern(pattern)])));
+        assert_eq!(pattern_error(extra.to_js()), format!("extras: {problem}"));
+    }
+    // An assertion inside a repetition of exactly zero compiles to nothing,
+    // and tree-sitter accepts it.
+    assert!(
+        reaching(&["x"])
+            .rule("x", Rule::pattern("a(?:^){0}"))
+            .to_js()
+            .is_ok()
+    );
+}
+
+#[test]
+fn test_validate_pattern_error_preview_is_short_and_printable() {
+    let long = format!("{}(", "a".repeat(100));
+    let problem = pattern_error(base().rule("x", Rule::pattern(long)).to_js());
+    assert_eq!(
+        problem,
+        format!("x: unterminated group at byte 100 of `{}…`", "a".repeat(40))
+    );
+    let control = pattern_error(base().rule("x", Rule::pattern("\t\u{1b}(")).to_js());
+    assert_eq!(control, r"x: unterminated group at byte 2 of `\t\u{1b}(`");
+}
+
+#[test]
+fn test_valid_patterns_are_written_as_before() {
+    // Validation adds no rewriting: every pattern that validates is written
+    // exactly as 1.0.0 wrote it.
+    let cases = [
+        ("[/]", r"/[\/]/"),
+        (r"[\]/]", r"/[\]\/]/"),
+        (r"[\[]", r"/[\[]/"),
+        ("]", "/]/"),
+        (r"[^/\\s]?", r"/[^\/\\s]?/"),
+        ("a{ 2 }", "/a{ 2 }/"),
+        (r"(?<name>[a-z]+)", "/(?<name>[a-z]+)/"),
+        ("a\tb", r"/a\tb/"),
+        (r"end\", r"/end\\/"),
+    ];
+    for (pattern, written) in cases {
+        let js = reaching(&["x"])
+            .rule("x", Rule::pattern(pattern))
+            .to_js()
+            .unwrap();
+        assert!(
+            js.contains(&format!("x: $ => {written},")),
+            "{pattern}: {js}"
+        );
+    }
+}
+
 #[test]
 fn test_validate_empty_string_is_refused_in_reachable_rules_only() {
     // Tree-sitter: "The rule `x` contains an empty string" — but it drops
@@ -1042,10 +1198,16 @@ fn test_js_repeated_inline_entries_are_written_once() {
 }
 
 #[test]
-fn test_js_pattern_starting_with_a_quantifier_uses_the_constructor() {
-    // `/*` would open a comment; tree-sitter then reports the regex error.
-    let js = base().rule("x", Rule::pattern("*a")).to_js().unwrap();
-    assert!(js.contains("x: $ => new RegExp('*a'),"));
+fn test_validate_pattern_starting_with_a_quantifier_is_refused() {
+    // Until 1.0.1 this was written `new RegExp('*a')` (`/*` would open a
+    // comment) and left for tree-sitter to refuse; no JavaScript regular
+    // expression starts with a quantifier, so validation now refuses it.
+    assert_eq!(
+        base().rule("x", Rule::pattern("*a")).to_js(),
+        Err(Error::EmptyString {
+            rule: "x: a quantifier has nothing to repeat at byte 0 of `*a`".into()
+        })
+    );
 }
 
 #[test]

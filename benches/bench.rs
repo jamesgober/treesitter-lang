@@ -3,6 +3,9 @@
 //! - `emit/js/*`, `emit/json/*`: validate and emit a grammar into a reused
 //!   buffer, for a small real grammar and a synthetic one of 1,000 rules.
 //! - `emit/escapes`: a grammar whose strings and patterns all need escaping.
+//! - `patterns/*`: validate and emit a grammar of 100,000 realistic patterns,
+//!   and one whose single pattern is about a megabyte long; validation
+//!   parses every pattern twice, as JavaScript and as tree-sitter would.
 //! - `sexp/*`: render a concrete syntax tree of about 10,000 and 100,000
 //!   elements into a reused buffer.
 //! - `build/large`: construct the 1,000-rule grammar, then drop it.
@@ -152,6 +155,56 @@ fn bench_emit(c: &mut Criterion) {
     group.finish();
 }
 
+/// Patterns as real grammars write them.
+const SHAPES: [&str; 8] = [
+    r"[a-zA-Z_][a-zA-Z0-9_]*",
+    r"\d+(\.\d+)?([eE][+-]?\d+)?",
+    r#""([^"\\]|\\.)*""#,
+    r"//[^\n]*",
+    r"/\*[^*]*\*+([^/*][^*]*\*+)*/",
+    r"0[xX][0-9a-fA-F]+(_[0-9a-fA-F]+)*",
+    r"\p{L}[\p{L}\p{N}_]*",
+    r"(?<tag>[a-z]+)(?::[a-z]+){0,3}",
+];
+
+/// `count` distinct patterns, all reachable, so both checks run on each.
+fn many_patterns(count: usize) -> Grammar {
+    let patterns = (0..count).map(|i| Rule::pattern(format!("{}{i}", SHAPES[i % SHAPES.len()])));
+    Grammar::new("patterns").rule("source_file", Rule::repeat(Rule::choice(patterns)))
+}
+
+/// One pattern of about a megabyte: a long concatenation of alternations,
+/// classes, groups, and escapes.
+fn long_pattern() -> Grammar {
+    let pattern = r"(?:[a-z_]\d+|\w\.|[^/\]]{2,3}|\p{L})".repeat(28_000);
+    Grammar::new("long").rule("source_file", Rule::repeat(Rule::pattern(pattern)))
+}
+
+fn bench_patterns(c: &mut Criterion) {
+    let mut group = c.benchmark_group("patterns");
+    let mut buffer = String::new();
+    let count = 100_000;
+    let grammar = many_patterns(count);
+    group.throughput(Throughput::Elements(count as u64));
+    group.bench_function("many/100000", |b| {
+        b.iter(|| {
+            buffer.clear();
+            grammar.write_json(&mut buffer).unwrap();
+            black_box(buffer.len())
+        });
+    });
+    let grammar = long_pattern();
+    group.throughput(Throughput::Bytes(1_000_000));
+    group.bench_function("long/1MB", |b| {
+        b.iter(|| {
+            buffer.clear();
+            grammar.write_json(&mut buffer).unwrap();
+            black_box(buffer.len())
+        });
+    });
+    group.finish();
+}
+
 /// Tree names: three visible rules, one hidden rule, anonymous punctuation.
 fn name(kind: &u8) -> &'static str {
     ["call", "args", "_group", "identifier", "(", ","][usize::from(*kind)]
@@ -203,5 +256,5 @@ fn bench_build(c: &mut Criterion) {
     c.bench_function("build/large", |b| b.iter(|| black_box(large())));
 }
 
-criterion_group!(benches, bench_emit, bench_sexp, bench_build);
+criterion_group!(benches, bench_emit, bench_patterns, bench_sexp, bench_build);
 criterion_main!(benches);

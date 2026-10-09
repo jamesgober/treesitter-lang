@@ -12,13 +12,15 @@ use core::fmt;
 /// 1. names (the grammar's, then each rule's, then each external's), the
 ///    start rule, and duplicate rules;
 /// 2. every rule body in definition order, then the extras: symbols resolve
-///    and are not inside tokens, patterns and choices are not empty, field
-///    and alias names are identifiers;
+///    and are not inside tokens, patterns and choices are not empty,
+///    patterns are regular expressions JavaScript accepts, field and alias
+///    names are identifiers;
 /// 3. the names in `word`, `conflicts`, `inline`, and `supertypes` resolve;
 /// 4. the rules reachable from the start rule and the extras: no cycle of
 ///    rules that can each be just the next; then, in definition order, no
-///    empty strings, and nothing that can match the empty string where
-///    tree-sitter needs a token;
+///    empty strings, only patterns tree-sitter's regular expression parser
+///    accepts, and nothing that can match the empty string where
+///    tree-sitter needs a token; then the patterns in the extras;
 /// 5. the word token, externals sharing a rule's name, inlined rules, and
 ///    supertypes.
 ///
@@ -103,13 +105,32 @@ pub enum Error {
 
     /// A string literal in a reachable rule is empty — tree-sitter refuses
     /// these outside tokens and in most places inside them, and the rest can
-    /// only match nothing — or a pattern anywhere is empty, which cannot be
-    /// written as a JavaScript regular expression literal.
+    /// only match nothing — or a pattern is empty or is not a regular
+    /// expression tree-sitter can use.
+    ///
+    /// A pattern must be a regular expression literal JavaScript accepts,
+    /// wherever it is, because `grammar.js` evaluates every rule; and, in a
+    /// rule reachable from the start rule or in an extra, one tree-sitter's
+    /// own regular expression parser accepts. The accepted forms are listed
+    /// in
+    /// [`docs/API.md`](https://github.com/jamesgober/treesitter-lang/blob/main/docs/API.md#accepted-patterns).
+    ///
+    /// For an empty string or pattern, `rule` is the name of the rule (or
+    /// `extras`). For an invalid pattern — non-empty — `rule` is that name,
+    /// then `: `, then what is wrong, the byte offset in the pattern where it
+    /// is, and the start of the pattern, as in
+    /// `` "number: unterminated character class at byte 0 of `[0-9`" ``.
+    /// Rule names never contain `: `, so the part before the first `: ` is
+    /// always the rule's name. (The error type is frozen at 1.0; this
+    /// variant, the one for a pattern that cannot be written as a regular
+    /// expression literal, carries the report.)
     ///
     /// Use [`Rule::blank`](crate::Rule::blank) or
-    /// [`Rule::optional`](crate::Rule::optional) to express "nothing".
+    /// [`Rule::optional`](crate::Rule::optional) to express "nothing"; fix
+    /// an invalid pattern as the report says.
     EmptyString {
-        /// Where the empty string or pattern was found.
+        /// Where the empty string or pattern was found, and for an invalid
+        /// pattern, what is wrong with it.
         rule: String,
     },
 
@@ -254,7 +275,14 @@ impl fmt::Display for Error {
             Self::UndefinedSymbol { symbol, rule } => {
                 write!(f, "`{rule}` refers to undefined symbol `{symbol}`")
             }
-            Self::EmptyString { rule } => write!(f, "`{rule}` contains an empty string or pattern"),
+            // A rule name never contains `: `; an invalid pattern's report
+            // does, after the rule's name.
+            Self::EmptyString { rule } => match rule.split_once(": ") {
+                Some((name, problem)) => {
+                    write!(f, "`{name}` contains an invalid pattern: {problem}")
+                }
+                None => write!(f, "`{rule}` contains an empty string or pattern"),
+            },
             Self::EmptyChoice { rule } => {
                 write!(f, "`{rule}` contains a choice with no alternatives")
             }
@@ -317,6 +345,19 @@ mod tests {
                 .starts_with("rule `args` can match the empty string")
         );
         assert!(Error::NoRules.to_string().contains("no rules"));
+    }
+
+    #[test]
+    fn test_display_tells_empty_from_invalid_patterns() {
+        let empty = Error::EmptyString { rule: "x".into() };
+        assert_eq!(empty.to_string(), "`x` contains an empty string or pattern");
+        let invalid = Error::EmptyString {
+            rule: "x: unterminated group at byte 0 of `(`".into(),
+        };
+        assert_eq!(
+            invalid.to_string(),
+            "`x` contains an invalid pattern: unterminated group at byte 0 of `(`"
+        );
     }
 
     #[test]

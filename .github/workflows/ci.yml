@@ -78,6 +78,24 @@ jobs:
       - name: Check against tree-sitter
         run: bash dev/conformance.sh target/conformance
 
+  node:
+    # Node.js as a dev-only test oracle: fuzzed grammars full of hostile
+    # strings and validated patterns must each give a grammar.js that passes
+    # `node --check` and evaluates, in a sandbox without `require` or
+    # `process`, to exactly the grammar.json emitted beside it. The test is
+    # ignored in the matrix above, which has no Node.js requirement.
+    name: grammar.js under Node.js
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check emitted grammar.js
+        run: cargo test --test node -- --ignored
+
   security:
     name: Security (audit + deny)
     runs-on: ubuntu-latest

@@ -83,3 +83,64 @@ Additive 1.x candidates (not commitments):
 - Pattern flags (`/.../i`).
 - Anonymous aliases (`alias(rule, 'text')`).
 - A `Grammar::check` that validates without emitting.
+
+## v1.0.1 - Security patch (DONE)
+Fixes ISSUES H06 and the validation part of M79 in `lang-collection/_lexersketch/ISSUES.md`.
+No public API added or removed.
+- [x] Every pattern validated against both parsers that read it; invalid ones refused with the reason and byte offset.
+- [x] Emission safe without validation: no regular expression literal can extend past its closing slash.
+- [x] Class-aware test reader, H06 regression test, hostile-pattern properties, Node.js oracle job.
+
+Delivered 2026-10-08:
+
+- **H06, code injection through `grammar.js`.** A pattern with an unclosed
+  `[` kept its `/.../` literal open, so the text after it in `grammar.js`
+  became code when tree-sitter evaluated the file. Fixed in validation and,
+  independently, in emission (`src/text.rs`: from the first class that would
+  never close, every `[` is written `\[`; `src/js.rs`: an empty pattern is
+  written `new RegExp('')`).
+- **Pattern validation** (`src/pattern.rs`): two recognizers, one per parser
+  a pattern meets. The JavaScript one follows ECMAScript Annex B (no flags,
+  ES2025 modifier groups and named references included) and runs on every
+  rule, because `grammar.js` evaluates every rule. The tree-sitter one
+  follows regex-syntax 0.8's parser branch for branch, after tree-sitter's
+  textual `\w`/`\s`/`\d`/`\W`/`\S`/`\D` rewrite, including its nesting limit
+  of 250, plus tree-sitter's refusal of assertions that survive into the
+  compiled expression; it runs on reachable rules and extras, the patterns
+  tree-sitter reads. Both are single forward passes with explicit stacks.
+  Reports reuse `Error::EmptyString` (the error type is frozen): `rule` is
+  the rule's name, `: `, then reason, offset, and the start of the pattern.
+- **How it was checked.** Against V8 (Node.js 24) and a replica of
+  tree-sitter 0.27's pattern pipeline on regex-syntax 0.8.11, 500,000 random
+  patterns (structured and chaotic) agreed except in the documented
+  unchecked places; 60,000 deeply nested ones agreed on the nesting limit;
+  the replica and the verdicts were confirmed against the real tree-sitter
+  0.27.0 CLI (`--js-runtime node` and `native`) on 633 patterns, which
+  disagreed only on unknown `\p{…}` names and on one huge counted repetition
+  tree-sitter timed out on, and showed that QuickJS refuses modifier groups.
+  These oracles are development tools: none is a dependency, and the only
+  one in CI is Node.js, in the `node` job.
+- **Left unchecked, documented in `docs/API.md#accepted-patterns`:**
+  property names in `\p{…}` (they need Unicode tables), the
+  `ID_Start`/`ID_Continue` class of non-ASCII group-name characters, and
+  repeated group names in rules tree-sitter drops (engines differ: V8 in
+  Node.js 24 accepts `(?<a>x(?<a>y)|z)`, which ES2025 refuses). Each is
+  accepted rather than refused, so no working grammar is refused; at worst
+  the error appears when `grammar.js` loads or tree-sitter generates, as
+  before. None can end a literal early.
+
+Dependency wiring: none. No dependency was added; `syntax-lang` 1 remains
+the only one. regex-syntax, the tree-sitter CLI, and Node.js were used as
+test oracles outside the crate; Node.js runs in CI as a dev-only oracle
+(`actions/setup-node`), per LexerSketch decision D3.
+
+## v1.1.0 - Planned (additive)
+The rest of ISSUES M79, all additive to the frozen 1.0 surface:
+- [ ] Named precedences: tree-sitter's `precedences` field, and a rule constructor for a named level.
+- [ ] Reserved-word sets (tree-sitter 0.25's `reserved`).
+- [ ] Anonymous aliases (`alias(rule, 'text')`).
+- [ ] `Grammar::check`, validating without emitting.
+
+Still candidates, not scheduled: pattern flags (`/.../i`). M79 also lists
+external scanner generation, which is outside 1.1.0's scope until its design
+is decided.

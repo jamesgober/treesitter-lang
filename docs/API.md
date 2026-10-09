@@ -262,7 +262,7 @@ found as an [`Error`](#error):
 | The start rule is visible. | [`HiddenStart`](#error) |
 | No two rules share a name. | [`DuplicateRule`](#error) |
 | Every symbol names a rule or an external — in rules, extras, `word`, `conflicts`, `inline`, and `supertypes`. | [`UndefinedSymbol`](#error) |
-| No pattern is empty, and no string in a reachable rule. | [`EmptyString`](#error) |
+| No pattern is empty, and no string in a reachable rule. Every pattern is a regular expression JavaScript accepts, and — in reachable rules and the extras — one tree-sitter's own regular expression parser accepts (see [accepted patterns](#accepted-patterns)). | [`EmptyString`](#error) |
 | No choice is empty. | [`EmptyChoice`](#error) |
 | No symbol appears inside a token, or inside an extra that is not a lone symbol. | [`SymbolInToken`](#error) |
 | No reachable rule that another rule (or an extra) refers to, and nothing a reachable `repeat` repeats, can match the empty string. | [`MatchesEmpty`](#error) |
@@ -277,8 +277,9 @@ Two ideas from tree-sitter run through the table:
 - **Reachability.** Tree-sitter drops rules that cannot be reached from the
   start rule or the extras before it builds the parser, so the checks that
   depend on how rules are used — empty strings, empty matches, cycles,
-  supertype shapes — apply only to reachable rules. The checks `grammar.js`
-  itself would trip on (names, symbols, tokens) apply to every rule.
+  supertype shapes, and tree-sitter's parse of each pattern — apply only to
+  reachable rules. The checks `grammar.js` itself would trip on (names,
+  symbols, tokens, JavaScript's parse of each pattern) apply to every rule.
 - **Token rules.** A rule whose whole body is a string, a pattern, a
   [`token`](#ruletoken), or an [`immediate`](#ruleimmediate) token becomes a
   token of its own — unless it is the start rule, or another reachable rule
@@ -500,17 +501,68 @@ regular expression — what goes between the slashes of `/.../`. Use a raw
 string (`r"\d+"`) so backslashes need no doubling. A `/` is written as `\/`
 and a control character as `\n`, `\r`, `\t`, or `\xHH`, so the pattern fits
 in a `/.../` literal; the regular expression is unchanged. `grammar.json`
-records the pattern the same way, as tree-sitter would. A pattern starting
-with `*` — never a valid regular expression — is written as
-`new RegExp('...')`, so tree-sitter reports the real error rather than a
-JavaScript syntax error.
+records the pattern the same way, as tree-sitter would.
 
 | Parameter | Meaning |
 |---|---|
-| `regex` | The pattern source; must not be empty. |
+| `regex` | The pattern source; must not be empty, and must be one of the [accepted patterns](#accepted-patterns). |
 
-An empty pattern is [`Error::EmptyString`](#error). Whether the pattern is a
-valid regular expression is left to tree-sitter.
+An empty or invalid pattern is [`Error::EmptyString`](#error); for an invalid
+one the error names the rule, says what is wrong, and gives the byte offset
+in the pattern.
+
+#### Accepted patterns
+
+A pattern passes through two parsers on its way into a lexer, and validation
+holds it to both:
+
+1. **JavaScript.** `grammar.js` holds the pattern as a `/.../` literal with
+   no flags, which the runtime that loads the file — Node.js, or
+   tree-sitter's built-in QuickJS with `--js-runtime native` — parses under
+   the web-compatible grammar of ECMAScript Annex B (B.1.2). This applies to
+   every pattern, in every rule and extra: `grammar.js` evaluates them all.
+2. **tree-sitter.** Tree-sitter reads the literal's source back, rewrites
+   `\w`, `\s`, `\d`, `\W`, `\S`, and `\D` into bracketed classes — textually,
+   so `\\D` becomes `\[^0-9]` — parses the result with the Rust
+   `regex-syntax` crate (0.8), and refuses any assertion left in it. This
+   applies to the patterns of rules reachable from the start rule and of the
+   extras; tree-sitter never reads the others.
+
+The two grammars differ, so the accepted patterns are those both accept. The
+pattern then *means* what regex-syntax makes of it: JavaScript's reading only
+decides whether `grammar.js` loads.
+
+| Construct | Accepted | Refused |
+|---|---|---|
+| Characters | Any character. `/`, control characters, and line separators are escaped for you. | — |
+| Escapes | `\` before any ASCII punctuation or space; `\t` `\n` `\r` `\f` `\v` `\a`; `\xHH`, `\uHHHH`, `\UHHHHHHHH`, `\x{H…}`, `\u{H…}` naming a Unicode scalar value; `\d` `\w` `\s` `\D` `\W` `\S`; `\p{…}`, `\pL`, `\P{…}`. | `\0`–`\9` (backreferences and octal escapes), `\c`, `\k`, `\e`, and other letters regex-syntax does not define; `\` before a non-ASCII character; surrogate escapes (`\uD83D`); `\p{}`. |
+| Classes | `[…]` and `[^…]`; ranges in order; a leading `]` (`[]a]`) or `-`; nested classes, `&&`, `--`, and `~~` (regex-syntax set operations, which JavaScript reads as plain characters); `[:alpha:]` and the other ASCII classes inside a class. | A class unclosed in either reading (`[[a]` is closed for JavaScript but not for regex-syntax); a range out of order, by code point for regex-syntax and by UTF-16 code unit for JavaScript (`[😀-😁]`); a range ending in a class (`[a-\pL]`) or an assertion; `[]` and `[^]`. |
+| Groups | `(…)`, `(?:…)`, `(?<name>…)` with a name of ASCII letters, digits, and `_`, not starting with a digit; modifier groups `(?i:…)`, `(?m:…)`, `(?s:…)`, `(?i-s:…)`. | Look-ahead and look-behind; `(?P<name>…)`; flags without a group, `(?i)`; repeated or empty names; unclosed or unmatched parentheses. |
+| Repetition | `*`, `+`, `?`, `{n}`, `{n,}`, `{n,m}` with `n ≤ m < 2³²`, spaces allowed around the numbers, each optionally lazy (`?`). | A quantifier with nothing to repeat — at the start, after `(` or `\|`, after an assertion, or after another quantifier (`a**`, `\x{41}{2}`, which JavaScript reads as `x` repeated 41 times, then repeated again); a `{` that is not a whole quantifier (`{`, `a{`, `a{,3}`). |
+| Assertions | Only inside a repetition of exactly zero, `(?:^){0}`, which compiles to nothing. | `^`, `$`, `\b`, `\B`, `\A`, `\z`, `\<`, `\>`, `\b{start}` and the other word boundaries. |
+| Nesting | Up to 250 levels, as regex-syntax counts them: groups, repetitions, alternations, concatenations of two or more, classes and class operations. | Deeper. |
+
+What validation does not check, all reported by `tree-sitter generate` or
+the JavaScript runtime as before:
+
+- The property names in `\p{…}` and `\P{…}`; regex-syntax knows them from
+  Unicode tables this crate does not carry.
+- Whether a non-ASCII character in a group name is a JavaScript identifier
+  character (`ID_Start`, `ID_Continue`).
+- Repeated group names in rules tree-sitter drops, where only JavaScript
+  reads them: ES2025 allows repeats in different alternatives, and engines
+  differ on exactly where.
+- How long tree-sitter takes to expand a large counted repetition into its
+  lexer: `a{100000}` is accepted, and takes tree-sitter a long time.
+- Runtime differences in the JavaScript checked against: modifier groups
+  (`(?i:…)`) are ES2025, verified with Node.js 24 — tree-sitter 0.27's
+  QuickJS runtime refuses them, as may older Node.js releases.
+
+Whatever a pattern holds, the literal `grammar.js` writes for it ends at its
+own closing slash: a `[` that would open a character class running past the
+end of the pattern is written `\[`, and an empty pattern or one starting
+with `*` as `new RegExp('…')`. Validation refuses all of these first, so
+valid patterns are written unchanged; this is a second line of defence.
 
 ```rust
 use treesitter_lang::{Grammar, Rule};
@@ -2007,13 +2059,15 @@ Validation reports the first problem, checking in this order:
 1. names (the grammar's, then each rule's, then each external's), the start
    rule, and duplicate rules;
 2. every rule body in definition order, then the extras: symbols resolve and
-   are not inside tokens, patterns and choices are not empty, field and alias
-   names are identifiers;
+   are not inside tokens, patterns and choices are not empty, patterns are
+   regular expressions JavaScript accepts, field and alias names are
+   identifiers;
 3. the names in `word`, `conflicts`, `inline`, and `supertypes` resolve;
 4. the rules reachable from the start rule and the extras: no cycle of rules
    that can each be just the next; then, in definition order, no empty
-   strings, and nothing that can match the empty string where tree-sitter
-   needs a token;
+   strings, only patterns tree-sitter's regular expression parser accepts,
+   and nothing that can match the empty string where tree-sitter needs a
+   token; then the patterns in the extras;
 5. the word token, externals sharing a rule's name, inlined rules, and
    supertypes.
 
@@ -2029,7 +2083,7 @@ and `core::error::Error`.
 | `DuplicateRule { name }` | Two rules share a name. | Rename one, or merge them with a `choice`. |
 | `HiddenStart { name }` | The first rule's name starts with `_`. | Make the start rule visible. |
 | `UndefinedSymbol { symbol, rule }` | A symbol names neither a rule nor an external. | Fix the typo, or define the rule or external. |
-| `EmptyString { rule }` | A pattern is empty, or a string in a reachable rule. | Express "nothing" with `blank` or `optional`. |
+| `EmptyString { rule }` | A pattern is empty or is not one of the [accepted patterns](#accepted-patterns), or a string in a reachable rule is empty. For an invalid pattern, `rule` is the rule's name, `: `, then what is wrong and where: `` "number: unterminated character class at byte 0 of `[0-9`" ``. | Express "nothing" with `blank` or `optional`; fix an invalid pattern as the report says. |
 | `EmptyChoice { rule }` | A choice has no alternatives. | Give it at least one. |
 | `SymbolInToken { symbol, rule }` | A symbol appears inside `token`, `immediate`, or an extra that is not a lone symbol. | Inline the referenced rule's strings and patterns, or make the extra a symbol. |
 | `MatchesEmpty { rule }` | A reachable rule another rule (or an extra) refers to can match the empty string, or something a `repeat` repeats can. | Make it match at least one token; put the `optional` at its uses, or use `repeat1`. |
@@ -2051,6 +2105,24 @@ let result = Grammar::new("demo")
 
 match result {
     Err(Error::MatchesEmpty { rule }) => assert_eq!(rule, "body"),
+    other => panic!("unexpected {other:?}"),
+}
+```
+
+```rust
+use treesitter_lang::{Error, Grammar, Rule};
+
+let result = Grammar::new("demo")
+    .rule("source_file", Rule::repeat(Rule::symbol("number")))
+    .rule("number", Rule::pattern("[0-9"))
+    .to_js();
+
+match result {
+    Err(Error::EmptyString { rule }) => {
+        assert_eq!(rule, "number: unterminated character class at byte 0 of `[0-9`");
+        // The rule's name is everything before the first `: `.
+        assert_eq!(rule.split_once(": ").map(|(name, _)| name), Some("number"));
+    }
     other => panic!("unexpected {other:?}"),
 }
 ```
@@ -2228,7 +2300,8 @@ As of `1.0.0` the public API is frozen. treesitter-lang follows
   (conflicts, and extras whose end it cannot tell); and a grammar validation
   refuses is one tree-sitter refuses, crashes on, or hangs on — apart from the
   documented stricter checks. Checks may be refined in a minor release only
-  to follow tree-sitter more closely; the stricter checks stay.
+  to follow tree-sitter more closely; the stricter checks stay. (1.0.1
+  brought patterns under this contract as a security fix: see below.)
 - The **output contract** holds: `to_js` writes a `grammar.js` that describes
   exactly the grammar built, and `to_json` writes tree-sitter's
   `grammar.json` for it, generating the same parser. The `grammar.json`
@@ -2249,9 +2322,25 @@ validation reports first when a grammar has several, the `Display` wording of
 `Error`, the `Debug` output of any type, and performance figures — the
 benchmarks are tracked, but they are measurements, not guarantees.
 
-Features left for later minor releases, all additive: named precedences
-(tree-sitter's `precedences` field), reserved-word sets, pattern flags, and
-anonymous aliases.
+**1.0.1 and patterns.** Until 1.0.1 a pattern was emitted unchecked, its
+validity left to tree-sitter, and a pattern with an unclosed character class
+could make the emitted `grammar.js` run text from the grammar's own strings
+as code when tree-sitter evaluated it (ISSUES H06). 1.0.1 checks every
+pattern against both parsers that read it (see
+[accepted patterns](#accepted-patterns)) and writes every literal so that it
+ends at its own closing slash. The patterns newly refused are ones the
+JavaScript runtime or tree-sitter already refused, so no `grammar.js` that
+loaded and generated stops validating. One workflow is affected: a grammar
+emitted only as `grammar.json`, with a pattern JavaScript refuses but
+tree-sitter's parser accepts (`a**`, `[😀-😁]`), validated before and is
+refused now — both formats describe one grammar, and its `grammar.js` could
+never load. The public surface is unchanged: the report travels in
+[`Error::EmptyString`](#error).
+
+Features planned for 1.1.0, all additive: named precedences (tree-sitter's
+`precedences` field), reserved-word sets, anonymous aliases, and a
+`Grammar::check` that validates without emitting. Pattern flags remain a
+candidate.
 
 See [`../dev/ROADMAP.md`](../dev/ROADMAP.md) and
 [`../CHANGELOG.md`](../CHANGELOG.md).

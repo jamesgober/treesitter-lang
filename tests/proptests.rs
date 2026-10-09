@@ -4,6 +4,11 @@
 //!   `grammar.js` and as `grammar.json` and read back by independent parsers
 //!   written here, is the tree that went in — whatever characters its strings
 //!   contain.
+//! - A pattern either fails validation or stays inside its own regular
+//!   expression literal: for arbitrary pattern text next to a hostile
+//!   string, `grammar.js` read by a JavaScript-correct scanner holds exactly
+//!   one literal per pattern, equal to the `grammar.json` value, the string
+//!   intact after it, and nothing else (ISSUES H06).
 //! - The empty-string check agrees with a direct recursive definition of
 //!   tree-sitter's rule.
 //! - S-expressions agree with a direct recursive renderer, and are indented
@@ -144,20 +149,61 @@ fn text() -> impl Strategy<Value = String> {
     prop::collection::vec(ch, 1..8).prop_map(String::from_iter)
 }
 
-/// Pattern source with no characters `grammar.js` rewrites, so it reads back
+/// A regular expression both JavaScript and tree-sitter accept, with no
+/// characters `grammar.js` rewrites, so it validates and reads back
 /// unchanged from both formats.
 fn pattern() -> impl Strategy<Value = String> {
-    let ch = prop::sample::select(vec![
-        'a', 'z', '0', '\\', '[', ']', '(', ')', '.', '*', '+', '?', '|', '^', '$', '{', '}', '-',
-        ' ', '"', '\'', 'é',
+    let atom = prop::sample::select(vec![
+        "a", "z", "0", "é", "_", " ", ".", "'", "\"", "]", "}", ",", r"\d", r"\w", r"\s", r"\.",
+        r"\(", r"\)", r"\[", r"\]", r"\{", r"\}", r"\\", r"\*", r"\|", r"\-", r"\'", r"\u0041",
+        r"\x41", r"\p{L}",
+    ])
+    .prop_map(String::from);
+    let item = prop::sample::select(vec![
+        "a", "z", "0", "é", "_", " ", ".", "$", "'", "\"", "a-z", "0-9", r"\]", r"\[", r"\\",
+        r"\-", r"\d", r"\w",
     ]);
-    prop::collection::vec(ch, 1..8).prop_map(|chars| {
-        let mut s = String::from_iter(chars);
-        if s.ends_with('\\') {
-            s.push('d');
-        }
-        s
+    let class = (any::<bool>(), prop::collection::vec(item, 1..4)).prop_map(|(negated, items)| {
+        format!("[{}{}]", if negated { "^" } else { "" }, items.concat())
+    });
+    let quantifier =
+        prop::sample::select(vec!["", "", "*", "+", "?", "*?", "{2}", "{1,3}", "{2,}"]);
+    let piece = (prop_oneof![atom, class], quantifier.clone()).prop_map(|(a, q)| a + q);
+    let leaf = prop::collection::vec(piece, 1..4).prop_map(|pieces| pieces.concat());
+    leaf.prop_recursive(3, 24, 3, move |inner| {
+        prop_oneof![
+            prop::collection::vec(inner.clone(), 2..4).prop_map(|parts| parts.concat()),
+            prop::collection::vec(inner.clone(), 2..4)
+                .prop_map(|alternatives| format!("(?:{})", alternatives.join("|"))),
+            (inner.clone(), quantifier.clone()).prop_map(|(r, q)| format!("({r}){q}")),
+            (inner, quantifier.clone()).prop_map(|(r, q)| format!("(?:{r}){q}")),
+        ]
     })
+}
+
+/// Pattern text with no regard for validity: brackets, slashes, escapes,
+/// quantifiers, quotes, and line breaks, plus arbitrary characters.
+fn hostile_pattern() -> impl Strategy<Value = String> {
+    let ch = prop_oneof![
+        4 => prop::sample::select(vec![
+            '[', ']', '\\', '/', '*', '(', ')', '{', '}', '\'', '"', '\n', '\u{2028}', 'a', '^',
+            '-', '|', '?', '<', '>', ',',
+        ]),
+        1 => any::<char>(),
+    ];
+    prop::collection::vec(ch, 0..10).prop_map(String::from_iter)
+}
+
+/// Strings that would run as code if a pattern's literal swallowed the text
+/// in front of them.
+fn payload() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just(String::from(r#"]/,require("fs").rmSync("x")),//"#)),
+        Just(String::from("*/,process.exit(1),/*")),
+        Just(String::from("]/;throw 1;//")),
+        Just(String::from("'+(()=>{throw 1})()+'")),
+        text(),
+    ]
 }
 
 fn ident() -> impl Strategy<Value = String> {
@@ -379,12 +425,16 @@ fn from_json(j: &Json) -> M {
 }
 
 fn start_from_json(json: &str) -> M {
+    rule_from_json(json, "start")
+}
+
+fn rule_from_json(json: &str, name: &str) -> M {
     let doc = Reader {
         s: json.as_bytes(),
         at: 0,
     }
     .json();
-    from_json(doc.get("rules").get("start"))
+    from_json(doc.get("rules").get(name))
 }
 
 // --- Reading grammar.js back ------------------------------------------------
@@ -466,21 +516,47 @@ impl Js<'_> {
             }
         }
     }
+    /// A regular expression literal, read as a JavaScript lexer reads one:
+    /// a backslash escapes the next character, and inside a character class
+    /// — from `[` to the next unescaped `]` — a `/` does not end the
+    /// literal. Returns the text between the slashes.
     fn regex(&mut self) -> String {
         self.expect("/");
         let mut out = String::new();
         let mut chars = self.s[self.at..].char_indices();
+        let mut in_class = false;
         loop {
-            let (i, c) = chars.next().unwrap();
+            let (i, c) = chars
+                .next()
+                .expect("unterminated regular expression literal");
             match c {
-                '/' => {
+                '/' if !in_class => {
                     self.at += i + 1;
+                    // Flags would follow straight after; none are written.
+                    assert!(
+                        !self.s[self.at..]
+                            .starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '$'),
+                        "regular expression flags"
+                    );
                     return out;
                 }
                 '\n' | '\r' | '\u{2028}' | '\u{2029}' => panic!("raw line break in a regex"),
                 '\\' => {
                     out.push('\\');
-                    out.push(chars.next().unwrap().1);
+                    let (_, e) = chars.next().expect("lone backslash");
+                    assert!(
+                        !matches!(e, '\n' | '\r' | '\u{2028}' | '\u{2029}'),
+                        "escaped line break"
+                    );
+                    out.push(e);
+                }
+                '[' if !in_class => {
+                    in_class = true;
+                    out.push(c);
+                }
+                ']' if in_class => {
+                    in_class = false;
+                    out.push(c);
                 }
                 c => out.push(c),
             }
@@ -571,6 +647,26 @@ fn start_from_js(js: &str) -> M {
     let m = reader.expr();
     reader.expect(",");
     m
+}
+
+/// Every rule of a `grammar.js`, in order, read up to the closing lines of
+/// the file, which must follow the last rule and end it.
+fn rules_from_js(js: &str) -> Vec<(String, M)> {
+    let at = js.find("\n  rules: {\n").unwrap() + "\n  rules: {\n".len();
+    let mut reader = Js { s: js, at };
+    let mut rules = Vec::new();
+    loop {
+        reader.ws();
+        if reader.s[reader.at..].starts_with("},") {
+            assert_eq!(&reader.s[reader.at..], "},\n});\n", "text after the rules");
+            return rules;
+        }
+        let name = reader.ident();
+        reader.expect(": $ =>");
+        let m = reader.expr();
+        reader.expect(",");
+        rules.push((name, m));
+    }
 }
 
 // --- S-expressions ----------------------------------------------------------
@@ -729,6 +825,33 @@ fn test_generators_are_not_vacuous() {
     );
     assert!(special > N / 10, "escapable strings in {special}/{N}");
     assert!(deep > N / 10, "nested trees in {deep}/{N}");
+
+    // Hostile patterns are sometimes valid — some with a class or a slash,
+    // which the scanner must read correctly — and usually not; valid
+    // patterns are always valid.
+    let (mut valid, mut tricky) = (0, 0);
+    for _ in 0..N {
+        let p = hostile_pattern().new_tree(&mut runner).unwrap().current();
+        let ok = Grammar::new("g")
+            .rule("start", Rule::pattern(p.clone()))
+            .to_js()
+            .is_ok();
+        valid += usize::from(ok);
+        tricky += usize::from(ok && p.contains(['[', '/']));
+        let p = pattern().new_tree(&mut runner).unwrap().current();
+        let result = Grammar::new("g")
+            .rule("start", Rule::pattern(p.clone()))
+            .to_js();
+        assert!(result.is_ok(), "{p:?}: {result:?}");
+    }
+    assert!(
+        valid > N / 20 && valid < N / 2,
+        "valid hostile patterns {valid}/{N}"
+    );
+    assert!(
+        tricky > N / 100,
+        "valid hostile patterns with `[` or `/` {tricky}/{N}"
+    );
 }
 
 proptest! {
@@ -744,6 +867,51 @@ proptest! {
     fn prop_js_round_trips(m in model()) {
         let js = grammar_with(&m).to_js().unwrap();
         prop_assert_eq!(start_from_js(&js), m);
+    }
+
+    #[test]
+    fn prop_patterns_are_refused_or_stay_inside_their_literal(
+        pattern in hostile_pattern(),
+        text in payload(),
+        reachable in any::<bool>(),
+    ) {
+        let body = Rule::seq([Rule::pattern(pattern.clone()), Rule::string(text.clone())]);
+        let grammar = if reachable {
+            Grammar::new("prop").rule("start", body)
+        } else {
+            Grammar::new("prop").rule("start", Rule::string("x")).rule("other", body)
+        };
+        let name = if reachable { "start" } else { "other" };
+        match (grammar.to_js(), grammar.to_json()) {
+            (Ok(js), Ok(json)) => {
+                // grammar.json records the literal's text as tree-sitter would
+                // read it back; grammar.js must hold exactly that literal, then
+                // the string, then nothing but the rest of the file.
+                let expected = rule_from_json(&json, name);
+                let M::Seq(parts) = &expected else {
+                    return Err(TestCaseError::fail("not a sequence"));
+                };
+                prop_assert!(matches!(&parts[..], [M::Pat(_), M::Str(s)] if *s == text));
+                let rules = rules_from_js(&js);
+                let read = rules.iter().find(|(n, _)| n == name).map(|(_, m)| m);
+                prop_assert_eq!(read, Some(&expected));
+                prop_assert_eq!(rules.len(), if reachable { 1 } else { 2 });
+            }
+            (Err(a), Err(b)) => {
+                prop_assert_eq!(&a, &b);
+                let Error::EmptyString { rule } = &a else {
+                    return Err(TestCaseError::fail(format!("unexpected {a:?}")));
+                };
+                prop_assert!(pattern.is_empty() || rule.starts_with(&format!("{name}: ")), "{rule}");
+                // The offset in the report is a character boundary of the
+                // pattern.
+                if let Some(at) = rule.split(" at byte ").nth(1).and_then(|r| r.split(' ').next()) {
+                    let at: usize = at.parse().unwrap();
+                    prop_assert!(pattern.is_char_boundary(at), "{rule}");
+                }
+            }
+            (js, json) => prop_assert!(false, "formats disagree: {js:?} / {json:?}"),
+        }
     }
 
     #[test]

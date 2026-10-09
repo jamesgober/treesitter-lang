@@ -72,11 +72,12 @@
 //! Emitting validates the grammar and refuses, with an [`Error`], what
 //! tree-sitter would refuse — or crash or hang on: names that are not
 //! identifiers, a grammar with no rules or a hidden start rule, duplicate
-//! rules, symbols that name nothing, empty strings and patterns, symbols
-//! inside a token, rules (and repetitions) that can match nothing where
-//! tree-sitter needs a token, cycles of rules that can each be just the next,
-//! and word, external, inline, and supertype declarations tree-sitter cannot
-//! honour. Each check was probed against the tree-sitter CLI, and the whole
+//! rules, symbols that name nothing, empty strings and patterns, patterns
+//! that are not regular expressions both JavaScript and tree-sitter accept,
+//! symbols inside a token, rules (and repetitions) that can match nothing
+//! where tree-sitter needs a token, cycles of rules that can each be just the
+//! next, and word, external, inline, and supertype declarations tree-sitter
+//! cannot honour. Each check was probed against the tree-sitter CLI, and the whole
 //! was cross-checked by running thousands of random grammars through both.
 //! What validation does not do is build parse tables: conflicts are found by
 //! `tree-sitter generate`, and declared with [`Grammar::conflict`].
@@ -128,6 +129,7 @@ mod error;
 mod grammar;
 mod js;
 mod json;
+mod pattern;
 mod rule;
 mod sexp;
 mod text;

@@ -159,8 +159,15 @@ impl Rule {
     /// compiles it into its lexer. Write it as a raw string (`r"\d+"`) so
     /// backslashes need no doubling. A `/` in the pattern is written as `\/`,
     /// and a line break as `\n` or `\r`, so it fits in a `/.../` literal; the
-    /// regular expression is the same. The pattern must not be empty
-    /// ([`Error::EmptyString`](crate::Error::EmptyString)).
+    /// regular expression is the same. The pattern must not be empty, and
+    /// must be a regular expression tree-sitter can use
+    /// ([`Error::EmptyString`](crate::Error::EmptyString)): one JavaScript
+    /// accepts as a `/.../` literal without flags, and — in a rule reachable
+    /// from the start rule, or in an extra — one tree-sitter's own parser
+    /// accepts, which refuses assertions (`^`, `$`, `\b`), look-around,
+    /// backreferences, and a few escapes JavaScript allows. The full list is
+    /// in
+    /// [`docs/API.md`](https://github.com/jamesgober/treesitter-lang/blob/main/docs/API.md#accepted-patterns).
     ///
     /// | Parameter | Meaning |
     /// |---|---|

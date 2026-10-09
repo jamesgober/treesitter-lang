@@ -6,10 +6,12 @@
 //!
 //! - **Load-time checks** apply to every rule, because `grammar.js` evaluates
 //!   every rule: names are identifiers, symbols resolve, tokens contain no
-//!   symbols, patterns are not empty.
+//!   symbols, patterns are not empty and are regular expressions JavaScript
+//!   accepts (see [`crate::pattern`]).
 //! - **Reachability checks** apply only to rules reachable from the start
 //!   rule or the extras, because tree-sitter drops the rest before building
-//!   the parser: strings are not empty, a rule other rules refer to cannot
+//!   the parser: strings are not empty, patterns are ones tree-sitter's own
+//!   regular expression parser accepts, a rule other rules refer to cannot
 //!   match nothing, nor can what a `repeat` repeats, no rules form a cycle
 //!   of each being just the next, and supertypes produce one node per
 //!   alternative.
@@ -33,11 +35,12 @@
 //! Every walk is iterative, so a rule nested arbitrarily deep is checked
 //! without recursion.
 
-use alloc::{string::String, vec, vec::Vec};
+use alloc::{format, string::String, vec, vec::Vec};
 use core::ptr;
 
 use crate::{
     Error, Grammar, Rule,
+    pattern::{Checker, Invalid},
     rule::{Expr, Prec, Text},
 };
 
@@ -152,11 +155,12 @@ pub(crate) fn validate(grammar: &Grammar) -> Result<(), Error> {
             name: String::from(name),
         });
     }
-    let graph = load(grammar, &index)?;
+    let mut patterns = Checker::default();
+    let graph = load(grammar, &index, &mut patterns)?;
     references(grammar, &index)?;
     let reach = reach(grammar, &graph);
     unit_cycles(grammar, &graph, &reach)?;
-    reachable_rules(grammar, &reach)?;
+    reachable_rules(grammar, &reach, &mut patterns)?;
     word(grammar, &index, &reach)?;
     externals(grammar, &index, &reach)?;
     inline(grammar, &index, &reach)?;
@@ -226,7 +230,7 @@ fn undefined(symbol: &str, rule: &str) -> Error {
 
 /// The load-time checks on every rule body and every extra, collecting the
 /// references between rules on the way.
-fn load(grammar: &Grammar, index: &Index<'_>) -> Result<Graph, Error> {
+fn load(grammar: &Grammar, index: &Index<'_>, patterns: &mut Checker) -> Result<Graph, Error> {
     let count = grammar.rules.len();
     let mut graph = Graph {
         starts: Vec::with_capacity(count + 1),
@@ -244,7 +248,7 @@ fn load(grammar: &Grammar, index: &Index<'_>) -> Result<Graph, Error> {
             units: &mut graph.units,
             rule: i,
         };
-        load_rule(body, name, false, index, &mut stack, refs)?;
+        load_rule(body, name, false, index, &mut stack, refs, patterns)?;
     }
     graph.starts.push(graph.edges.len());
     graph.unit_starts.push(graph.units.len());
@@ -266,7 +270,7 @@ fn load(grammar: &Grammar, index: &Index<'_>) -> Result<Graph, Error> {
                     units: &mut units,
                     rule: usize::MAX,
                 };
-                load_rule(extra, "extras", true, index, &mut stack, refs)?;
+                load_rule(extra, "extras", true, index, &mut stack, refs, patterns)?;
             }
         }
     }
@@ -284,8 +288,9 @@ struct Refs<'a> {
 }
 
 /// Checks one rule body in source order: symbols resolve and are not inside
-/// a token, patterns are not empty, choices have alternatives, and field and
-/// alias names are identifiers. Records the rules it refers to in `refs`.
+/// a token, patterns are not empty and are regular expressions JavaScript
+/// accepts, choices have alternatives, and field and alias names are
+/// identifiers. Records the rules it refers to in `refs`.
 fn load_rule<'g>(
     root: &'g Rule,
     rule: &str,
@@ -293,6 +298,7 @@ fn load_rule<'g>(
     index: &Index<'_>,
     stack: &mut Vec<(&'g Rule, bool, bool)>,
     refs: Refs<'_>,
+    patterns: &mut Checker,
 ) -> Result<(), Error> {
     stack.clear();
     stack.push((root, lexical, true));
@@ -318,6 +324,11 @@ fn load_rule<'g>(
                     rule: String::from(rule),
                 });
             }
+            // `grammar.js` evaluates every rule, so every pattern must be a
+            // regular expression literal its JavaScript runtime accepts.
+            Expr::Pattern(text) => patterns
+                .javascript(text)
+                .map_err(|problem| invalid_pattern(rule, text, problem))?,
             Expr::Choice(rules) if rules.is_empty() => {
                 return Err(Error::EmptyChoice {
                     rule: String::from(rule),
@@ -391,11 +402,12 @@ fn reach(grammar: &Grammar, graph: &Graph) -> Reach {
     Reach { reachable, used }
 }
 
-/// For every reachable rule, in definition order: no empty string, and
-/// nothing that can match nothing where tree-sitter needs something — the
-/// rule itself if another rule refers to it, and anything a `repeat` or
-/// `repeat1` repeats.
-fn reachable_rules(grammar: &Grammar, reach: &Reach) -> Result<(), Error> {
+/// For every reachable rule, in definition order: no empty string, every
+/// pattern one tree-sitter's regular expression parser accepts, and nothing
+/// that can match nothing where tree-sitter needs something — the rule
+/// itself if another rule refers to it, and anything a `repeat` or `repeat1`
+/// repeats. Then the patterns in the extras, which tree-sitter always keeps.
+fn reachable_rules(grammar: &Grammar, reach: &Reach, patterns: &mut Checker) -> Result<(), Error> {
     let mut walk = Vec::new();
     let mut frames = Vec::new();
     for (i, (name, body)) in grammar.rules.iter().enumerate() {
@@ -408,12 +420,17 @@ fn reachable_rules(grammar: &Grammar, reach: &Reach) -> Result<(), Error> {
         walk.clear();
         walk.push(body);
         while let Some(node) = walk.pop() {
-            if matches!(&node.0, Expr::String(text) if text.is_empty()) {
-                return Err(Error::EmptyString {
-                    rule: String::from(&**name),
-                });
+            match &node.0 {
+                Expr::String(text) if text.is_empty() => {
+                    return Err(Error::EmptyString {
+                        rule: String::from(&**name),
+                    });
+                }
+                Expr::Pattern(text) => patterns
+                    .tree_sitter(text)
+                    .map_err(|problem| invalid_pattern(name, text, problem))?,
+                _ => walk.extend(node.children()),
             }
-            walk.extend(node.children());
         }
         let (empty, empty_repeat) = nullability(body, &mut frames);
         if empty_repeat || (empty && reach.used[i]) {
@@ -422,7 +439,47 @@ fn reachable_rules(grammar: &Grammar, reach: &Reach) -> Result<(), Error> {
             });
         }
     }
+    for extra in grammar.extras.iter().flatten() {
+        walk.clear();
+        walk.push(extra);
+        while let Some(node) = walk.pop() {
+            match &node.0 {
+                Expr::Pattern(text) => patterns
+                    .tree_sitter(text)
+                    .map_err(|problem| invalid_pattern("extras", text, problem))?,
+                _ => walk.extend(node.children()),
+            }
+        }
+    }
     Ok(())
+}
+
+/// The error for a pattern that is not a regular expression tree-sitter can
+/// use. [`Error`] is frozen, so this reuses [`Error::EmptyString`], the
+/// variant for a pattern that cannot be written as a regular expression
+/// literal: `rule` holds the rule's name, `: `, and what is wrong and where.
+/// Rule names never contain `: `, which is how `Display` tells the two
+/// apart.
+fn invalid_pattern(rule: &str, pattern: &str, problem: Invalid) -> Error {
+    const PREVIEW: usize = 40;
+    let mut preview = String::new();
+    for (n, c) in pattern.chars().enumerate() {
+        if n == PREVIEW {
+            preview.push('…');
+            break;
+        }
+        if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
+            preview.extend(c.escape_default());
+        } else {
+            preview.push(c);
+        }
+    }
+    Error::EmptyString {
+        rule: format!(
+            "{rule}: {} at byte {} of `{preview}`",
+            problem.reason, problem.at
+        ),
+    }
 }
 
 /// One frame of [`nullability`]: a rule whose parts are being evaluated.
@@ -1053,7 +1110,7 @@ mod tests {
             .rule("note", Rule::seq([Rule::string("#"), Rule::symbol("text")]))
             .rule("text", Rule::pattern("[a-z]+"));
         let index = Index::new(&g);
-        let graph = load(&g, &index);
+        let graph = load(&g, &index, &mut Checker::default());
         assert!(graph.is_ok());
         let Ok(graph) = graph else { return };
         let reach = reach(&g, &graph);

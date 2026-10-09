@@ -153,10 +153,13 @@ impl<'g> Printer<'g> {
         match &rule.0 {
             Expr::Blank => out.push_str("blank()"),
             Expr::String(text) => js_string(out, text),
-            // `/*` would open a comment. No regular expression starts with a
-            // quantifier, so the constructor form only makes tree-sitter
-            // report the pattern's real error instead of a syntax error.
-            Expr::Pattern(pattern) if pattern.starts_with('*') => {
+            // `/*` would open a block comment and `//` a line comment.
+            // Validation refuses both patterns — no regular expression is
+            // empty or starts with a quantifier — so this is a second line
+            // of defence: the constructor form keeps the pattern inside a
+            // string literal, where it cannot change what the code around it
+            // means.
+            Expr::Pattern(pattern) if pattern.is_empty() || pattern.starts_with('*') => {
                 out.push_str("new RegExp(");
                 js_string(out, pattern);
                 out.push(')');
@@ -351,6 +354,131 @@ mod tests {
             Rule::seq([Rule::seq([Rule::symbol("a")]), Rule::symbol("b")]),
         );
         assert_eq!(print(&rule), "prec(1, seq(\n  seq($.a),\n  $.b,\n))");
+    }
+
+    /// The length of the JavaScript regular expression literal at the start
+    /// of `s`, read as a JavaScript lexer reads one: a backslash escapes the
+    /// next character, a `[` opens a class that the next unescaped `]`
+    /// closes, and only a `/` outside a class ends the literal. `None` if
+    /// there is no literal there.
+    fn regex_literal(s: &str) -> Option<usize> {
+        let terminator = |c: char| matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}');
+        let rest = s.strip_prefix('/')?;
+        // `//` and `/*` open comments.
+        if rest.starts_with(['/', '*']) {
+            return None;
+        }
+        let mut chars = rest.char_indices();
+        let mut in_class = false;
+        while let Some((i, c)) = chars.next() {
+            match c {
+                c if terminator(c) => return None,
+                '\\' => match chars.next() {
+                    Some((_, e)) if !terminator(e) => {}
+                    _ => return None,
+                },
+                '[' => in_class = true,
+                ']' => in_class = false,
+                '/' if !in_class => return Some(i + 2),
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The single-quoted JavaScript string literal at the start of `s`:
+    /// its value and its length.
+    fn string_literal(s: &str) -> Option<(String, usize)> {
+        let rest = s.strip_prefix('\'')?;
+        let mut value = String::new();
+        let mut chars = rest.char_indices();
+        let hex = |chars: &mut core::str::CharIndices<'_>, n: usize| {
+            let mut v = 0;
+            for _ in 0..n {
+                v = v * 16 + chars.next()?.1.to_digit(16)?;
+            }
+            char::from_u32(v)
+        };
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '\'' => return Some((value, i + 2)),
+                '\n' | '\r' | '\u{2028}' | '\u{2029}' => return None,
+                '\\' => value.push(match chars.next()?.1 {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    'x' => hex(&mut chars, 2)?,
+                    'u' => hex(&mut chars, 4)?,
+                    e => e,
+                }),
+                c => value.push(c),
+            }
+        }
+        None
+    }
+
+    /// Reads `seq(<pattern>, <string>)` as a JavaScript lexer would: the
+    /// pattern as one regular expression literal or one `new RegExp(...)`
+    /// call on a string, then one string literal. The string's value, if
+    /// that is all the text holds.
+    fn pattern_then_string(printed: &str) -> Option<String> {
+        let rest = printed.strip_prefix("seq(")?.trim_start();
+        let rest = match rest.strip_prefix("new RegExp(") {
+            Some(inner) => {
+                let (_, n) = string_literal(inner)?;
+                inner[n..].strip_prefix(')')?
+            }
+            None => &rest[regex_literal(rest)?..],
+        };
+        let rest = rest.strip_prefix(',')?.trim_start();
+        let (value, n) = string_literal(rest)?;
+        let rest = rest[n..].trim_start();
+        let rest = rest.strip_prefix(',').unwrap_or(rest).trim_start();
+        (rest == ")").then_some(value)
+    }
+
+    #[test]
+    fn test_hostile_patterns_cannot_leave_their_literal_even_unvalidated() {
+        // ISSUES H06, second line of defence. Printed without validation,
+        // every pattern of up to five characters from a hostile alphabet
+        // stays one literal (or one `new RegExp` string), and the string
+        // after it survives intact: nothing it holds can become code.
+        const ALPHABET: [char; 10] = ['[', ']', '\\', '/', '*', 'a', '\n', '\u{2028}', '(', '\''];
+        let payload = r#"]/,require("fs").rmSync("x")),//"#;
+        let mut digits: Vec<usize> = Vec::new();
+        loop {
+            let pattern: String = digits.iter().map(|&d| ALPHABET[d]).collect();
+            let printed = print(&Rule::seq([
+                Rule::pattern(pattern.clone()),
+                Rule::string(payload),
+            ]));
+            assert_eq!(
+                pattern_then_string(&printed).as_deref(),
+                Some(payload),
+                "{pattern:?} printed as {printed:?}"
+            );
+
+            // The next pattern, counting in base 10 over the alphabet.
+            match digits.iter().rposition(|&d| d + 1 < ALPHABET.len()) {
+                Some(at) => {
+                    digits[at] += 1;
+                    digits[at + 1..].iter_mut().for_each(|d| *d = 0);
+                }
+                None if digits.len() < 5 => {
+                    digits.iter_mut().for_each(|d| *d = 0);
+                    digits.push(0);
+                }
+                None => break,
+            }
+        }
+    }
+
+    #[test]
+    fn test_empty_pattern_is_printed_as_a_constructor() {
+        // `//` would open a comment; validation refuses empty patterns, so
+        // this is only the second line of defence.
+        assert_eq!(print(&Rule::pattern("")), "new RegExp('')");
+        assert_eq!(print(&Rule::pattern("*a")), "new RegExp('*a')");
     }
 
     #[test]
