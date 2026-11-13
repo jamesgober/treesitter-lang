@@ -84,7 +84,7 @@ Additive 1.x candidates (not commitments):
 - A `Grammar::check` that validates without emitting.
 
 ## v1.0.1 - Security patch (DONE)
-Fixes ISSUES H06 and the validation part of M79 in `lang-collection/_lexersketch/ISSUES.md`.
+Fixes ISSUES H06 and the validation part of M79 in the issue ledger.
 No public API added or removed.
 - [x] Every pattern validated against both parsers that read it; invalid ones refused with the reason and byte offset.
 - [x] Emission safe without validation: no regular expression literal can extend past its closing slash.
@@ -131,7 +131,7 @@ Delivered 2026-10-08:
 Dependency wiring: none. No dependency was added; `syntax-lang` 1 remains
 the only one. regex-syntax, the tree-sitter CLI, and Node.js were used as
 test oracles outside the crate; Node.js runs in CI as a dev-only oracle
-(`actions/setup-node`), per LexerSketch decision D3.
+(`actions/setup-node`), decision D3.
 
 ## v1.1.0 - Planned (additive)
 The rest of ISSUES M79, all additive to the frozen 1.0 surface:
